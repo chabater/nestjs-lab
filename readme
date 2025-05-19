@@ -1,0 +1,6 @@
+your-project/
+├── .devcontainer/
+│   ├── devcontainer.json
+│   └── Dockerfile
+├── package.json
+└── （你的 Node.js 程式碼）
