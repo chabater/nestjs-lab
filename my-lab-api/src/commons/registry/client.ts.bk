@@ -1,0 +1,187 @@
+import axios, { AxiosInstance } from 'axios';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import crypto from 'crypto';
+import zlib from 'zlib';
+import { request } from 'undici';
+import { Readable } from 'stream';
+import { pipeline } from 'stream';
+import { promisify } from 'util';
+
+const streamPipeline = promisify(pipeline);
+
+// ... existing types and helper functions remain unchanged ...
+
+type DockerAuthEntry = {
+  auth?: string
+}
+
+export interface RegistryClientOptions {
+  baseUrl: string
+  username?: string
+  password?: string
+  axiosInstance?: AxiosInstance
+  autoRedirect?: boolean
+  registryProxyMap?: Record<string, string>
+  blobProxyMap?: Record<string, string> 
+}
+
+function loadDockerConfig(): Record<string, any> {
+  try {
+    const configPath = path.join(os.homedir(), '.docker', 'config.json')
+    const content = fs.readFileSync(configPath, 'utf-8')
+    return JSON.parse(content)
+  } catch (err) {
+    return {}
+  }
+}
+
+function getAuthFromDockerConfig(registry: string): string | undefined {
+  const config = loadDockerConfig()
+  const auths = config.auths as Record<string, DockerAuthEntry>
+  const authEntry = Object.entries(auths).find(([key]) => {
+    return registry.includes(key) || key.includes(registry)
+  })
+
+  if (!authEntry) return undefined
+
+  const authBase64 = authEntry[1]?.auth
+  if (authBase64) {
+    return `Basic ${authBase64}`
+  }
+
+  return undefined
+}
+
+export class ContainerRegistryClient {
+  private readonly axios: AxiosInstance
+  private readonly autoRedirect: boolean
+
+  constructor(private readonly options: RegistryClientOptions) {
+    this.autoRedirect = options.autoRedirect !== undefined ? options.autoRedirect : true
+
+    const headers: Record<string, string> = {
+      Accept: 'application/vnd.docker.distribution.manifest.v2+json',
+    }
+
+    if (options.username && options.password) {
+      const token = Buffer.from(`${options.username}:${options.password}`).toString('base64')
+      headers['Authorization'] = `Basic ${token}`
+    } else {
+      const dockerToken = getAuthFromDockerConfig(options.baseUrl)
+      if (dockerToken) {
+        headers['Authorization'] = dockerToken
+      }
+    }
+
+    this.axios = options.axiosInstance ?? axios.create({
+      baseURL: options.baseUrl,
+      headers,
+    })
+  }
+
+  async getImageManifest(repository: string, tag: string) {
+    const url = `/v2/${repository}/manifests/${tag}`
+    const response = await this.axios.get(url)
+    return response.data
+  }
+
+  async pullBlobAsStream(repository: string, digest: string): Promise<{ stream: Readable, size: number, digest: string }> {
+    const url = `/v2/${repository}/blobs/${digest}`;
+    const response = await this.axios.get(url, {
+      responseType: 'stream',
+      maxRedirects: 0,
+      validateStatus: status => [200, 302, 307].includes(status),
+    });
+
+    if ([302, 307].includes(response.status)) {
+      const location = response.headers['location'];
+      if (!location) throw new Error('Missing redirect location');
+      const redirected = await axios.get(location, { responseType: 'stream' });
+      return {
+        stream: redirected.data,
+        digest,
+        size: parseInt(redirected.headers['content-length'] || '0', 10),
+      };
+    }
+
+    return {
+      stream: response.data,
+      digest,
+      size: parseInt(response.headers['content-length'] || '0', 10),
+    };
+  }
+
+  async streamBlob(sourceRepository: string, digest: string, destinationRepository: string): Promise<void> {
+    const uploadUrl = await this.startBlobUpload(destinationRepository);
+    const { stream, size } = await this.pullBlobAsStream(sourceRepository, digest);
+    await this.pushBlobStream(uploadUrl, stream, digest, size);
+  }
+
+  async startBlobUpload(repository: string): Promise<string> {
+    const response = await this.axios.post(`/v2/${repository}/blobs/uploads/`, null, {
+      headers: { 'Content-Length': '0' },
+      maxRedirects: 0,
+      validateStatus: status => status === 202,
+    });
+    return response.data.location || response.headers['location'];
+  }
+
+  async pushBlobStream(uploadUrl: string, stream: Readable, digest: string, size: number): Promise<void> {
+    const finalUrl = `${uploadUrl}${uploadUrl.includes('?') ? '&' : '?'}digest=${digest}`;
+    const { statusCode } = await request(finalUrl, {
+      method: 'PUT',
+      body: stream,
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': size.toString(),
+      }
+    });
+
+    if (statusCode !== 201) {
+      throw new Error(`Failed to push blob: status ${statusCode}`);
+    }
+  }
+
+  async syncImage(sourceRepo: string, sourceTag: string, destRepo: string, destTag: string) {
+    const manifest = await this.getImageManifest(sourceRepo, sourceTag);
+    const configDigest = manifest.config.digest;
+
+    // Stream config
+    const configUploadUrl = await this.startBlobUpload(destRepo);
+    const { stream: configStream, size: configSize } = await this.pullBlobAsStream(sourceRepo, configDigest);
+    await this.pushBlobStream(configUploadUrl, configStream, configDigest, configSize);
+
+    // Stream layers
+    for (const layer of manifest.layers) {
+      await this.streamBlob(sourceRepo, layer.digest, destRepo);
+    }
+
+    // Rebuild manifest using original digests and sizes
+    const newManifest = {
+      schemaVersion: 2,
+      mediaType: 'application/vnd.docker.distribution.manifest.v2+json',
+      config: {
+        mediaType: manifest.config.mediaType,
+        size: configSize,
+        digest: configDigest,
+      },
+      layers: manifest.layers.map(layer => ({
+        mediaType: layer.mediaType,
+        size: layer.size,
+        digest: layer.digest,
+      }))
+    };
+
+    await this.axios.put(`/v2/${destRepo}/manifests/${destTag}`, newManifest, {
+      headers: {
+        'Content-Type': 'application/vnd.docker.distribution.manifest.v2+json',
+      },
+    });
+  }
+
+  private sha256(buffer: Buffer): string {
+    return crypto.createHash('sha256').update(buffer).digest('hex')
+  }
+}

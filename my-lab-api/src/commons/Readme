@@ -1,0 +1,206 @@
+feature
+// src/registry/registry.module.ts
+import { Module } from '@nestjs/common';
+import { ScheduleModule } from '@nestjs/schedule';
+import { RegistryService } from './registry.service';
+import { RegistryController } from './registry.controller';
+import { ContainerRegistryClientFactory } from './registry.client-factory';
+import { ContainerRegistryClient } from './registry.client';
+
+@Module({
+  imports: [ScheduleModule.forRoot()],
+  controllers: [RegistryController],
+  providers: [RegistryService, ContainerRegistryClientFactory, ContainerRegistryClient],
+})
+export class RegistryModule {}
+
+// src/registry/registry.controller.ts
+import { Controller, Post, Body, Get } from '@nestjs/common';
+import { RegistryService } from './registry.service';
+
+@Controller('registry')
+export class RegistryController {
+  constructor(private readonly registryService: RegistryService) {}
+
+  @Post('sync')
+  async sync(@Body() body: { sourceRegistry: string; sourceRepo: string; sourceTag: string; destRegistry: string; destRepo: string; destTag: string }) {
+    return this.registryService.syncImageWithBuffer(
+      body.sourceRegistry,
+      body.sourceRepo,
+      body.sourceTag,
+      body.destRegistry,
+      body.destRepo,
+      body.destTag
+    );
+  }
+
+  @Get('metrics')
+  getMetrics() {
+    return this.registryService.getQueueMetrics();
+  }
+}
+
+// src/registry/registry.service.ts
+import os from 'os';
+import { Injectable, Logger } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
+import PQueue from 'p-queue';
+import { Readable } from 'stream';
+import { request } from 'undici';
+import { ContainerRegistryClientFactory } from './registry.client-factory';
+
+const DEFAULT_CONCURRENCY = 5;
+const MEMORY_THRESHOLD = 3 * 1024 * 1024 * 1024; // 3 GB
+
+@Injectable()
+export class RegistryService {
+  private readonly queue: PQueue;
+  private readonly memoryThreshold: number;
+  private readonly logger = new Logger(RegistryService.name);
+
+  constructor(private readonly clientFactory: ContainerRegistryClientFactory) {
+    this.memoryThreshold = MEMORY_THRESHOLD;
+    this.queue = new PQueue({ concurrency: DEFAULT_CONCURRENCY });
+  }
+
+  @Cron('*/10 * * * * *')
+  adjustConcurrency() {
+    const freeMem = os.freemem();
+    if (freeMem < this.memoryThreshold) {
+      this.queue.concurrency = Math.max(1, this.queue.concurrency - 1);
+    } else {
+      this.queue.concurrency = Math.min(10, this.queue.concurrency + 1);
+    }
+    this.logger.debug(`Adjusted concurrency: ${this.queue.concurrency}`);
+  }
+
+  async waitForMemoryAvailability() {
+    while (os.freemem() < this.memoryThreshold) {
+      this.logger.warn('Memory low, delaying task...');
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  }
+
+  async syncImageWithBuffer(sourceRegistry: string, sourceRepo: string, sourceTag: string, destRegistry: string, destRepo: string, destTag: string) {
+    return this.queue.add(async () => {
+      await this.waitForMemoryAvailability();
+
+      const sourceClient = this.clientFactory.create(sourceRegistry);
+      const destClient = this.clientFactory.create(destRegistry);
+
+      const manifest = await sourceClient.getManifest(sourceRepo, sourceTag);
+      const configDigest = manifest.config.digest;
+
+      const { stream: configStream, size: configSize } = await sourceClient.pullBlobAsStream(sourceRepo, configDigest);
+      await destClient.pushBlobStream(destRepo, configDigest, configStream, configSize);
+
+      for (const layer of manifest.layers) {
+        const { stream: layerStream, size: layerSize } = await sourceClient.pullBlobAsStream(sourceRepo, layer.digest);
+        await destClient.pushBlobStream(destRepo, layer.digest, layerStream, layerSize);
+      }
+
+      const newManifest = {
+        schemaVersion: 2,
+        mediaType: 'application/vnd.docker.distribution.manifest.v2+json',
+        config: {
+          mediaType: manifest.config.mediaType,
+          size: configSize,
+          digest: configDigest,
+        },
+        layers: manifest.layers.map(layer => ({
+          mediaType: layer.mediaType,
+          size: layer.size,
+          digest: layer.digest,
+        })),
+      };
+
+      await destClient.putManifest(destRepo, destTag, newManifest);
+    });
+  }
+
+  getQueueMetrics() {
+    return {
+      queueSize: this.queue.size,
+      pending: this.queue.pending,
+      concurrency: this.queue.concurrency,
+      memoryFree: os.freemem(),
+    };
+  }
+}
+
+// src/registry/registry.client-factory.ts
+import { Injectable } from '@nestjs/common';
+import { ContainerRegistryClient } from './registry.client';
+
+@Injectable()
+export class ContainerRegistryClientFactory {
+  create(registryUrl: string): ContainerRegistryClient {
+    return new ContainerRegistryClient(registryUrl);
+  }
+}
+
+// src/registry/registry.client.ts
+import axios, { AxiosInstance } from 'axios';
+import { Readable } from 'stream';
+import { request } from 'undici';
+
+export class ContainerRegistryClient {
+  private readonly client: AxiosInstance;
+
+  constructor(baseUrl: string) {
+    this.client = axios.create({
+      baseURL: baseUrl,
+      headers: {
+        Accept: 'application/vnd.docker.distribution.manifest.v2+json',
+      },
+    });
+  }
+
+  async getManifest(repository: string, tag: string) {
+    const res = await this.client.get(`/v2/${repository}/manifests/${tag}`);
+    return res.data;
+  }
+
+  async pullBlobAsStream(repository: string, digest: string): Promise<{ stream: Readable; size: number }> {
+    const res = await this.client.get(`/v2/${repository}/blobs/${digest}`, {
+      responseType: 'stream',
+    });
+    return {
+      stream: res.data,
+      size: parseInt(res.headers['content-length'] || '0', 10),
+    };
+  }
+
+  async pushBlobStream(repository: string, digest: string, stream: Readable, size: number) {
+    const uploadUrl = await this.startBlobUpload(repository);
+    const finalUrl = `${uploadUrl}${uploadUrl.includes('?') ? '&' : '?'}digest=${digest}`;
+
+    const { statusCode } = await request(finalUrl, {
+      method: 'PUT',
+      body: stream,
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': size.toString(),
+      },
+    });
+
+    if (statusCode !== 201) {
+      throw new Error(`Failed to push blob: status ${statusCode}`);
+    }
+  }
+
+  async putManifest(repository: string, tag: string, manifest: any) {
+    await this.client.put(`/v2/${repository}/manifests/${tag}`, manifest, {
+      headers: {
+        'Content-Type': 'application/vnd.docker.distribution.manifest.v2+json',
+      },
+    });
+  }
+
+  async startBlobUpload(repository: string): Promise<string> {
+    const response = await this.client.post(`/v2/${repository}/blobs/uploads/`, null, {
+      headers: { 'Content-Length': '0' },
+    });
+    return response.data.location || response.headers['location'];
+  }
+}
