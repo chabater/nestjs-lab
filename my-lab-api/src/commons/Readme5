@@ -1,0 +1,642 @@
+just copy
+
+npm install node-fetch @types/node --save
+
+copyImage(sourceRef: ImageRef, targetRef: ImageRef): Promise<void>
+│
+├─ fetchManifest(imageRef) → 判斷是單一 manifest 還是 multi-platform
+│   ├─ if schema == "manifest list" → 遞迴處理每個平台子 manifest
+│
+├─ for 每個 layer & config：
+│   ├─ downloadBlob(...)
+│   ├─ uploadBlob(...)
+│
+└─ uploadManifest(...)
+
+interface ImageRef {
+  registry: string;
+  repository: string;
+  reference: string; // tag 或 digest
+  token: string;     // 需支援 Harbor / ACR Token / Basic Auth
+}
+
+type MediaType = 'application/vnd.docker.distribution.manifest.v2+json'
+              | 'application/vnd.docker.container.image.v1+json'
+              | 'application/vnd.oci.image.manifest.v1+json'
+              | 'application/vnd.oci.image.index.v1+json'
+              | 'application/vnd.docker.distribution.manifest.list.v2+json'
+              | string;
+
+import fetch from 'node-fetch';
+
+async function fetchManifest(ref: ImageRef) {
+  const url = `https://${ref.registry}/v2/${ref.repository}/manifests/${ref.reference}`;
+  const res = await fetch(url, {
+    headers: {
+      'Authorization': `Bearer ${ref.token}`,
+      'Accept': 'application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json'
+    }
+  });
+
+  if (!res.ok) throw new Error(`Fetch manifest failed: ${res.statusText}`);
+  const contentType = res.headers.get('Content-Type');
+  const manifest = await res.json();
+
+  return { manifest, mediaType: contentType };
+}
+
+async function downloadBlob(ref: ImageRef, digest: string): Promise<NodeJS.ReadableStream> {
+  const url = `https://${ref.registry}/v2/${ref.repository}/blobs/${digest}`;
+  const res = await fetch(url, {
+    headers: { 'Authorization': `Bearer ${ref.token}` }
+  });
+  if (!res.ok) throw new Error(`Download blob ${digest} failed`);
+  return res.body as NodeJS.ReadableStream;
+}
+
+async function uploadBlob(ref: ImageRef, digest: string, stream: NodeJS.ReadableStream) {
+  const startRes = await fetch(`https://${ref.registry}/v2/${ref.repository}/blobs/uploads/`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${ref.token}` }
+  });
+
+  const location = startRes.headers.get('Location');
+  if (!location) throw new Error('No upload location');
+
+  const uploadUrl = `${location}&digest=${digest}`;
+  const res = await fetch(uploadUrl, {
+    method: 'PUT',
+    headers: {
+      'Authorization': `Bearer ${ref.token}`,
+      'Content-Type': 'application/octet-stream'
+    },
+    body: stream
+  });
+
+  if (!res.ok) throw new Error(`Upload blob ${digest} failed`);
+}
+
+async function uploadManifest(ref: ImageRef, manifest: any, mediaType: string, tagOrDigest: string) {
+  const url = `https://${ref.registry}/v2/${ref.repository}/manifests/${tagOrDigest}`;
+  const res = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      'Authorization': `Bearer ${ref.token}`,
+      'Content-Type': mediaType
+    },
+    body: JSON.stringify(manifest)
+  });
+
+  if (!res.ok) throw new Error(`Upload manifest failed: ${res.statusText}`);
+}
+
+async function copyImage(src: ImageRef, dest: ImageRef) {
+  const { manifest, mediaType } = await fetchManifest(src);
+
+  if (mediaType === 'application/vnd.docker.distribution.manifest.list.v2+json') {
+    console.log(`Multi-arch image detected`);
+    for (const m of manifest.manifests) {
+      const childSrc = { ...src, reference: m.digest };
+      const childDest = { ...dest, reference: m.digest };
+      await copyImage(childSrc, childDest); // recursive copy
+    }
+    await uploadManifest(dest, manifest, mediaType, dest.reference);
+    return;
+  }
+
+  const allBlobs = [
+    manifest.config.digest,
+    ...manifest.layers.map((l: any) => l.digest)
+  ];
+
+  for (const layer of manifest.layers) {
+    if (layer.mediaType.includes('foreign')) {
+      console.log(`Skipping foreign layer: ${layer.digest}`);
+      continue;
+    }
+
+    const stream = await downloadBlob(src, layer.digest);
+    await uploadBlob(dest, layer.digest, stream);
+  }
+
+  const configStream = await downloadBlob(src, manifest.config.digest);
+  await uploadBlob(dest, manifest.config.digest, configStream);
+
+  await uploadManifest(dest, manifest, mediaType, dest.reference);
+}
+
+
+改進設計方向（防 OOM）
+1. 使用 Node.js 的 stream.pipeline（自動錯誤處理與背壓控制）
+import { pipeline } from 'stream/promises';
+
+async function pipeBlob(srcStream: NodeJS.ReadableStream, dstUrl: string, token: string, digest: string) {
+  const uploadStart = await fetch(`${dstUrl}/blobs/uploads/`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` }
+  });
+
+  const location = uploadStart.headers.get('Location');
+  if (!location) throw new Error('No upload location');
+
+  const uploadPut = await fetch(`${location}&digest=${digest}`, {
+    method: 'PUT',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/octet-stream'
+    },
+    body: null // 我們用 `pipeline` 傳
+  });
+
+  const writable = uploadPut.body?.getWriter?.(); // only in WHATWG streams
+  if (!uploadPut.body || !uploadPut.body.writable) {
+    throw new Error('Writable stream not available in PUT request');
+  }
+
+  await pipeline(srcStream, uploadPut.body);
+}
+
+
+fetch() 在 Node.js 中對於 PUT 時還不支援「request body 為 Writable stream」。所以改用 http.request()（如下）更穩定。
+
+2. 改用原生 http.request() 管道轉寫（推薦）
+
+import * as https from 'https';
+import { pipeline } from 'stream/promises';
+
+async function uploadViaPipeline(srcStream: NodeJS.ReadableStream, dst: ImageRef, digest: string) {
+  const startRes = await fetch(`https://${dst.registry}/v2/${dst.repository}/blobs/uploads/`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${dst.token}` }
+  });
+
+  const location = startRes.headers.get('Location');
+  if (!location) throw new Error('Missing Location header');
+
+  return new Promise<void>((resolve, reject) => {
+    const putUrl = new URL(`${location}&digest=${digest}`);
+    const req = https.request({
+      hostname: putUrl.hostname,
+      path: putUrl.pathname + putUrl.search,
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${dst.token}`,
+        'Content-Type': 'application/octet-stream'
+      }
+    }, (res) => {
+      if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) resolve();
+      else reject(new Error(`Upload failed: ${res.statusCode}`));
+    });
+
+    req.on('error', reject);
+    pipeline(srcStream, req).catch(reject);
+  });
+}
+
+
+限制並發度（使用 p-limit）
+避免一次處理太多 blobs：
+
+import pLimit from 'p-limit';
+const limit = pLimit(2); // 最多同時 2 個 blob copy
+
+await Promise.all(allBlobs.map(digest => limit(async () => {
+  const stream = await downloadBlob(src, digest);
+  await uploadViaPipeline(stream, dest, digest);
+})));
+
+
+大檔預檢 & 錯誤安全釋放
+對於大 blob (>2GB)，你可以選擇：
+
+先檢查 size（用 HEAD 請求）
+
+使用臨時檔（如 /tmp/blob-${digest}）作為快取（stream-to-file, file-to-stream）
+
+const headRes = await fetch(blobUrl, {
+  method: 'HEAD',
+  headers: { Authorization: `Bearer ${token}` }
+});
+const size = Number(headRes.headers.get('Content-Length'));
+if (size > MAX_BLOB_SIZE) throw new Error('Blob too large');
+
+
+// ver 1 
+import fetch from 'node-fetch';
+import * as https from 'https';
+import { pipeline } from 'stream/promises';
+import pLimit from 'p-limit';
+
+interface ImageRef {
+  registry: string;
+  repository: string;
+  reference: string; // tag or digest
+  token: string;     // Bearer token or basic auth header
+}
+
+const ACCEPT_MANIFESTS = [
+  'application/vnd.docker.distribution.manifest.v2+json',
+  'application/vnd.docker.distribution.manifest.list.v2+json',
+  'application/vnd.oci.image.manifest.v1+json',
+  'application/vnd.oci.image.index.v1+json'
+];
+
+async function fetchManifest(ref: ImageRef): Promise<{ manifest: any; mediaType: string; digest: string }> {
+  const url = `https://${ref.registry}/v2/${ref.repository}/manifests/${ref.reference}`;
+  const res = await fetch(url, {
+    headers: {
+      'Authorization': `Bearer ${ref.token}`,
+      'Accept': ACCEPT_MANIFESTS.join(', ')
+    }
+  });
+  if (!res.ok) throw new Error(`Failed to fetch manifest: ${res.status} ${res.statusText}`);
+  const mediaType = res.headers.get('Content-Type') || '';
+  const digest = res.headers.get('Docker-Content-Digest') || '';
+  const manifest = await res.json();
+  return { manifest, mediaType, digest };
+}
+
+async function downloadBlob(ref: ImageRef, digest: string): Promise<NodeJS.ReadableStream> {
+  const url = `https://${ref.registry}/v2/${ref.repository}/blobs/${digest}`;
+  const res = await fetch(url, {
+    headers: { 'Authorization': `Bearer ${ref.token}` }
+  });
+  if (!res.ok) throw new Error(`Failed to download blob: ${res.status} ${res.statusText}`);
+  return res.body as NodeJS.ReadableStream;
+}
+
+async function uploadViaPipeline(srcStream: NodeJS.ReadableStream, ref: ImageRef, digest: string): Promise<void> {
+  const startRes = await fetch(`https://${ref.registry}/v2/${ref.repository}/blobs/uploads/`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${ref.token}` }
+  });
+
+  const location = startRes.headers.get('Location');
+  if (!location) throw new Error('Missing upload location');
+  const uploadUrl = new URL(`${location}&digest=${digest}`);
+
+  return new Promise<void>((resolve, reject) => {
+    const req = https.request({
+      hostname: uploadUrl.hostname,
+      path: uploadUrl.pathname + uploadUrl.search,
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${ref.token}`,
+        'Content-Type': 'application/octet-stream'
+      }
+    }, res => {
+      if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) resolve();
+      else reject(new Error(`Blob upload failed with status ${res.statusCode}`));
+    });
+    req.on('error', reject);
+    pipeline(srcStream, req).catch(reject);
+  });
+}
+
+async function uploadManifest(ref: ImageRef, manifest: any, mediaType: string, reference: string): Promise<void> {
+  const url = `https://${ref.registry}/v2/${ref.repository}/manifests/${reference}`;
+  const res = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      'Authorization': `Bearer ${ref.token}`,
+      'Content-Type': mediaType
+    },
+    body: JSON.stringify(manifest)
+  });
+  if (!res.ok) throw new Error(`Failed to upload manifest: ${res.status} ${res.statusText}`);
+}
+
+export async function copyImage(src: ImageRef, dest: ImageRef): Promise<void> {
+  const { manifest, mediaType, digest } = await fetchManifest(src);
+
+  if (mediaType.includes('manifest.list') || mediaType.includes('image.index')) {
+    console.log(`Multi-arch manifest detected`);
+    const subManifestPromises = manifest.manifests.map(async (m: any) => {
+      const subSrc = { ...src, reference: m.digest };
+      const subDest = { ...dest, reference: m.digest };
+      await copyImage(subSrc, subDest);
+    });
+    await Promise.all(subManifestPromises);
+    await uploadManifest(dest, manifest, mediaType, dest.reference);
+    return;
+  }
+
+  const limit = pLimit(2);
+  const layerBlobs = manifest.layers.filter((l: any) => !l.mediaType.includes('foreign'));
+
+  await Promise.all(layerBlobs.map(layer => limit(async () => {
+    const stream = await downloadBlob(src, layer.digest);
+    await uploadViaPipeline(stream, dest, layer.digest);
+  })));
+
+  const configStream = await downloadBlob(src, manifest.config.digest);
+  await uploadViaPipeline(configStream, dest, manifest.config.digest);
+
+  await uploadManifest(dest, manifest, mediaType, dest.reference);
+  console.log(`Image ${src.repository}@${digest} copied to ${dest.repository}@${dest.reference}`);
+}
+
+// Usage example (replace with real values):
+// await copyImage(
+//   { registry: 'source.registry.io', repository: 'my/image', reference: 'latest', token: 'xxx' },
+//   { registry: 'target.registry.io', repository: 'my/image', reference: 'latest', token: 'yyy' }
+// );
+
+
+// ver 2
+import fetch from 'node-fetch';
+import * as https from 'https';
+import { pipeline } from 'stream/promises';
+import pLimit from 'p-limit';
+
+interface ImageRef {
+  registry: string;
+  repository: string;
+  reference: string; // tag or digest
+  token: string;     // Bearer token or basic auth header
+}
+
+const ACCEPT_MANIFESTS = [
+  'application/vnd.docker.distribution.manifest.v2+json',
+  'application/vnd.docker.distribution.manifest.list.v2+json',
+  'application/vnd.oci.image.manifest.v1+json',
+  'application/vnd.oci.image.index.v1+json'
+];
+
+const MAX_MEMORY_MB = 300;
+const MAX_BLOB_SIZE_BYTES = 500 * 1024 * 1024; // 500MB 上限
+
+function isMemorySafe(): boolean {
+  const used = process.memoryUsage();
+  const usedMB = used.rss / 1024 / 1024;
+  return usedMB < MAX_MEMORY_MB;
+}
+
+async function checkBlobSize(ref: ImageRef, digest: string): Promise<number> {
+  const url = `https://${ref.registry}/v2/${ref.repository}/blobs/${digest}`;
+  const res = await fetch(url, {
+    method: 'HEAD',
+    headers: { 'Authorization': `Bearer ${ref.token}` }
+  });
+  if (!res.ok) throw new Error(`Failed to HEAD blob ${digest}: ${res.status}`);
+  const sizeStr = res.headers.get('Content-Length');
+  const size = sizeStr ? parseInt(sizeStr, 10) : NaN;
+  if (!Number.isFinite(size)) throw new Error(`Unknown blob size for ${digest}`);
+  if (size > MAX_BLOB_SIZE_BYTES) {
+    throw new Error(`Blob ${digest} too large: ${size} bytes`);
+  }
+  return size;
+}
+
+async function fetchManifest(ref: ImageRef): Promise<{ manifest: any; mediaType: string; digest: string }> {
+  const url = `https://${ref.registry}/v2/${ref.repository}/manifests/${ref.reference}`;
+  const res = await fetch(url, {
+    headers: {
+      'Authorization': `Bearer ${ref.token}`,
+      'Accept': ACCEPT_MANIFESTS.join(', ')
+    }
+  });
+  if (!res.ok) throw new Error(`Failed to fetch manifest: ${res.status} ${res.statusText}`);
+  const mediaType = res.headers.get('Content-Type') || '';
+  const digest = res.headers.get('Docker-Content-Digest') || '';
+  const manifest = await res.json();
+  return { manifest, mediaType, digest };
+}
+
+async function downloadBlob(ref: ImageRef, digest: string): Promise<NodeJS.ReadableStream> {
+  const url = `https://${ref.registry}/v2/${ref.repository}/blobs/${digest}`;
+  const res = await fetch(url, {
+    headers: { 'Authorization': `Bearer ${ref.token}` }
+  });
+  if (!res.ok) throw new Error(`Failed to download blob: ${res.status} ${res.statusText}`);
+  return res.body as NodeJS.ReadableStream;
+}
+
+async function uploadViaPipeline(srcStream: NodeJS.ReadableStream, ref: ImageRef, digest: string): Promise<void> {
+  const startRes = await fetch(`https://${ref.registry}/v2/${ref.repository}/blobs/uploads/`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${ref.token}` }
+  });
+
+  const location = startRes.headers.get('Location');
+  if (!location) throw new Error('Missing upload location');
+  const uploadUrl = new URL(`${location}&digest=${digest}`);
+
+  return new Promise<void>((resolve, reject) => {
+    const req = https.request({
+      hostname: uploadUrl.hostname,
+      path: uploadUrl.pathname + uploadUrl.search,
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${ref.token}`,
+        'Content-Type': 'application/octet-stream'
+      }
+    }, res => {
+      if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) resolve();
+      else reject(new Error(`Blob upload failed with status ${res.statusCode}`));
+    });
+    req.on('error', reject);
+    pipeline(srcStream, req).catch(reject);
+  });
+}
+
+async function uploadManifest(ref: ImageRef, manifest: any, mediaType: string, reference: string): Promise<void> {
+  const url = `https://${ref.registry}/v2/${ref.repository}/manifests/${reference}`;
+  const res = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      'Authorization': `Bearer ${ref.token}`,
+      'Content-Type': mediaType
+    },
+    body: JSON.stringify(manifest)
+  });
+  if (!res.ok) throw new Error(`Failed to upload manifest: ${res.status} ${res.statusText}`);
+}
+
+export async function copyImage(src: ImageRef, dest: ImageRef): Promise<void> {
+  const { manifest, mediaType, digest } = await fetchManifest(src);
+
+  if (mediaType.includes('manifest.list') || mediaType.includes('image.index')) {
+    console.log(`Multi-arch manifest detected`);
+    const subManifestPromises = manifest.manifests.map(async (m: any) => {
+      const subSrc = { ...src, reference: m.digest };
+      const subDest = { ...dest, reference: m.digest };
+      await copyImage(subSrc, subDest);
+    });
+    await Promise.all(subManifestPromises);
+    await uploadManifest(dest, manifest, mediaType, dest.reference);
+    return;
+  }
+
+  const limit = pLimit(2);
+  const layerBlobs = manifest.layers.filter((l: any) => !l.mediaType.includes('foreign'));
+
+  await Promise.all(layerBlobs.map(layer => limit(async () => {
+    await checkBlobSize(src, layer.digest);
+    if (!isMemorySafe()) throw new Error('Memory usage too high — aborting blob copy');
+    const stream = await downloadBlob(src, layer.digest);
+    await uploadViaPipeline(stream, dest, layer.digest);
+  })));
+
+  await checkBlobSize(src, manifest.config.digest);
+  if (!isMemorySafe()) throw new Error('Memory usage too high — aborting config copy');
+  const configStream = await downloadBlob(src, manifest.config.digest);
+  await uploadViaPipeline(configStream, dest, manifest.config.digest);
+
+  await uploadManifest(dest, manifest, mediaType, dest.reference);
+  console.log(`Image ${src.repository}@${digest} copied to ${dest.repository}@${dest.reference}`);
+}
+
+// Usage example (replace with real values):
+// await copyImage(
+//   { registry: 'source.registry.io', repository: 'my/image', reference: 'latest', token: 'xxx' },
+//   { registry: 'target.registry.io', repository: 'my/image', reference: 'latest', token: 'yyy' }
+// );
+
+// ver 3
+import { Injectable } from '@nestjs/common';
+import fetch from 'node-fetch';
+import * as https from 'https';
+import { pipeline } from 'stream/promises';
+import pLimit from 'p-limit';
+
+export interface ImageRef {
+  registry: string;
+  repository: string;
+  reference: string; // tag or digest
+  token: string;     // Bearer token or basic auth header
+}
+
+const ACCEPT_MANIFESTS = [
+  'application/vnd.docker.distribution.manifest.v2+json',
+  'application/vnd.docker.distribution.manifest.list.v2+json',
+  'application/vnd.oci.image.manifest.v1+json',
+  'application/vnd.oci.image.index.v1+json'
+];
+
+const MAX_MEMORY_MB = 300;
+const MAX_BLOB_SIZE_BYTES = 500 * 1024 * 1024; // 500MB 上限
+
+function isMemorySafe(): boolean {
+  const used = process.memoryUsage();
+  const usedMB = used.rss / 1024 / 1024;
+  return usedMB < MAX_MEMORY_MB;
+}
+
+@Injectable()
+export class RegistryCopyService {
+  private async checkBlobSize(ref: ImageRef, digest: string): Promise<number> {
+    const url = `https://${ref.registry}/v2/${ref.repository}/blobs/${digest}`;
+    const res = await fetch(url, {
+      method: 'HEAD',
+      headers: { 'Authorization': `Bearer ${ref.token}` }
+    });
+    if (!res.ok) throw new Error(`Failed to HEAD blob ${digest}: ${res.status}`);
+    const sizeStr = res.headers.get('Content-Length');
+    const size = sizeStr ? parseInt(sizeStr, 10) : NaN;
+    if (!Number.isFinite(size)) throw new Error(`Unknown blob size for ${digest}`);
+    if (size > MAX_BLOB_SIZE_BYTES) {
+      throw new Error(`Blob ${digest} too large: ${size} bytes`);
+    }
+    return size;
+  }
+
+  private async fetchManifest(ref: ImageRef): Promise<{ manifest: any; mediaType: string; digest: string }> {
+    const url = `https://${ref.registry}/v2/${ref.repository}/manifests/${ref.reference}`;
+    const res = await fetch(url, {
+      headers: {
+        'Authorization': `Bearer ${ref.token}`,
+        'Accept': ACCEPT_MANIFESTS.join(', ')
+      }
+    });
+    if (!res.ok) throw new Error(`Failed to fetch manifest: ${res.status} ${res.statusText}`);
+    const mediaType = res.headers.get('Content-Type') || '';
+    const digest = res.headers.get('Docker-Content-Digest') || '';
+    const manifest = await res.json();
+    return { manifest, mediaType, digest };
+  }
+
+  private async downloadBlob(ref: ImageRef, digest: string): Promise<NodeJS.ReadableStream> {
+    const url = `https://${ref.registry}/v2/${ref.repository}/blobs/${digest}`;
+    const res = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${ref.token}` }
+    });
+    if (!res.ok) throw new Error(`Failed to download blob: ${res.status} ${res.statusText}`);
+    return res.body as NodeJS.ReadableStream;
+  }
+
+  private async uploadViaPipeline(srcStream: NodeJS.ReadableStream, ref: ImageRef, digest: string): Promise<void> {
+    const startRes = await fetch(`https://${ref.registry}/v2/${ref.repository}/blobs/uploads/`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${ref.token}` }
+    });
+
+    const location = startRes.headers.get('Location');
+    if (!location) throw new Error('Missing upload location');
+    const uploadUrl = new URL(`${location}&digest=${digest}`);
+
+    return new Promise<void>((resolve, reject) => {
+      const req = https.request({
+        hostname: uploadUrl.hostname,
+        path: uploadUrl.pathname + uploadUrl.search,
+        method: 'PUT',
+        headers: {
+          'Authorization': `Bearer ${ref.token}`,
+          'Content-Type': 'application/octet-stream'
+        }
+      }, res => {
+        if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) resolve();
+        else reject(new Error(`Blob upload failed with status ${res.statusCode}`));
+      });
+      req.on('error', reject);
+      pipeline(srcStream, req).catch(reject);
+    });
+  }
+
+  private async uploadManifest(ref: ImageRef, manifest: any, mediaType: string, reference: string): Promise<void> {
+    const url = `https://${ref.registry}/v2/${ref.repository}/manifests/${reference}`;
+    const res = await fetch(url, {
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${ref.token}`,
+        'Content-Type': mediaType
+      },
+      body: JSON.stringify(manifest)
+    });
+    if (!res.ok) throw new Error(`Failed to upload manifest: ${res.status} ${res.statusText}`);
+  }
+
+  async copyImage(src: ImageRef, dest: ImageRef): Promise<void> {
+    const { manifest, mediaType, digest } = await this.fetchManifest(src);
+
+    if (mediaType.includes('manifest.list') || mediaType.includes('image.index')) {
+      console.log(`Multi-arch manifest detected`);
+      const subManifestPromises = manifest.manifests.map(async (m: any) => {
+        const subSrc = { ...src, reference: m.digest };
+        const subDest = { ...dest, reference: m.digest };
+        await this.copyImage(subSrc, subDest);
+      });
+      await Promise.all(subManifestPromises);
+      await this.uploadManifest(dest, manifest, mediaType, dest.reference);
+      return;
+    }
+
+    const limit = pLimit(2);
+    const layerBlobs = manifest.layers.filter((l: any) => !l.mediaType.includes('foreign'));
+
+    await Promise.all(layerBlobs.map(layer => limit(async () => {
+      await this.checkBlobSize(src, layer.digest);
+      if (!isMemorySafe()) throw new Error('Memory usage too high — aborting blob copy');
+      const stream = await this.downloadBlob(src, layer.digest);
+      await this.uploadViaPipeline(stream, dest, layer.digest);
+    })));
+
+    await this.checkBlobSize(src, manifest.config.digest);
+    if (!isMemorySafe()) throw new Error('Memory usage too high — aborting config copy');
+    const configStream = await this.downloadBlob(src, manifest.config.digest);
+    await this.uploadViaPipeline(configStream, dest, manifest.config.digest);
+
+    await this.uploadManifest(dest, manifest, mediaType, dest.reference);
+    console.log(`Image ${src.repository}@${digest} copied to ${dest.repository}@${dest.reference}`);
+  }
+}
