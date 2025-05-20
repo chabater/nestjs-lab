@@ -1,0 +1,220 @@
+// src/registry/registry.service.ts
+import { Injectable, Logger } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
+import os from 'os';
+import PQueue from 'p-queue';
+import fs from 'fs';
+import path from 'path';
+import { pipeline } from 'stream';
+import { promisify } from 'util';
+import { ContainerRegistryClientFactory } from './registry.client-factory';
+
+const pipelineAsync = promisify(pipeline);
+const TMP_DIR = path.resolve(__dirname, '../../tmp');
+
+const DEFAULT_CONCURRENCY = 5;
+const MAX_CONCURRENCY = 10;
+const MIN_CONCURRENCY = 1;
+const MEMORY_THRESHOLD = 3 * 1024 * 1024 * 1024; // 3GB
+const MAX_QUEUE_SIZE = 1000;
+
+@Injectable()
+export class RegistryService {
+  private readonly logger = new Logger(RegistryService.name);
+  private queue: PQueue;
+
+  constructor(private readonly clientFactory: ContainerRegistryClientFactory) {
+    this.queue = new PQueue({
+      concurrency: DEFAULT_CONCURRENCY,
+      queueClass: class extends PQueue.QueueClass {
+        enqueue(run, options) {
+          if (this.size >= MAX_QUEUE_SIZE) {
+            throw new Error('Queue overflow: too many concurrent requests');
+          }
+          return super.enqueue(run, options);
+        }
+      },
+    });
+
+    if (!fs.existsSync(TMP_DIR)) {
+      fs.mkdirSync(TMP_DIR, { recursive: true });
+    }
+  }
+
+  @Cron('*/10 * * * * *')
+  adjustConcurrency() {
+    const memUsage = process.memoryUsage();
+    const usedMemory = memUsage.heapUsed + memUsage.external + memUsage.arrayBuffers;
+
+    if (usedMemory > MEMORY_THRESHOLD) {
+      this.queue.concurrency = Math.max(MIN_CONCURRENCY, this.queue.concurrency - 1);
+      this.logger.warn(`Memory high (${(usedMemory / 1024 / 1024).toFixed(2)} MB), reducing concurrency to ${this.queue.concurrency}`);
+    } else if (this.queue.concurrency < MAX_CONCURRENCY) {
+      this.queue.concurrency++;
+      this.logger.log(`Memory OK, increasing concurrency to ${this.queue.concurrency}`);
+    }
+  }
+
+  getMetrics() {
+    const mem = process.memoryUsage();
+    return {
+      queueSize: this.queue.size,
+      pending: this.queue.pending,
+      concurrency: this.queue.concurrency,
+      memory: {
+        rss: mem.rss,
+        heapTotal: mem.heapTotal,
+        heapUsed: mem.heapUsed,
+        external: mem.external,
+        arrayBuffers: mem.arrayBuffers,
+      },
+      systemMemory: {
+        free: os.freemem(),
+        total: os.totalmem(),
+      },
+    };
+  }
+
+  private async waitForMemoryAvailability() {
+    while (true) {
+      const mem = process.memoryUsage();
+      const totalUsed = mem.heapUsed + mem.external + mem.arrayBuffers;
+      if (totalUsed < MEMORY_THRESHOLD) return;
+      this.logger.warn('Memory usage high, delaying task...');
+      await new Promise((res) => setTimeout(res, 1000));
+    }
+  }
+
+  /**
+   * 用 Stream 直接拉取並推送
+   */
+  async syncImageWithBuffer(
+    sourceRegistry: string,
+    sourceRepo: string,
+    sourceTag: string,
+    destRegistry: string,
+    destRepo: string,
+    destTag: string,
+  ) {
+    return this.queue.add(async () => {
+      await this.waitForMemoryAvailability();
+
+      const sourceClient = this.clientFactory.create(sourceRegistry);
+      const destClient = this.clientFactory.create(destRegistry);
+
+      this.logger.log(`[Buffer] Start syncing ${sourceRegistry}/${sourceRepo}:${sourceTag} → ${destRegistry}/${destRepo}:${destTag}`);
+
+      // 取得 manifest
+      const manifest = await sourceClient.getManifest(sourceRepo, sourceTag);
+      const configDigest = manifest.config.digest;
+
+      // 拉 config blob 並推送
+      const { stream: configStream, size: configSize } = await sourceClient.pullBlobAsStream(sourceRepo, configDigest);
+      await destClient.pushBlobStream(destRepo, configDigest, configStream, configSize);
+
+      // 逐層拉取 layer 並推送
+      for (const layer of manifest.layers) {
+        const { stream: layerStream, size: layerSize } = await sourceClient.pullBlobAsStream(sourceRepo, layer.digest);
+        await destClient.pushBlobStream(destRepo, layer.digest, layerStream, layerSize);
+      }
+
+      // 推送 manifest
+      await destClient.putManifest(destRepo, destTag, manifest);
+
+      this.logger.log(`[Buffer] Sync complete for ${sourceRegistry}/${sourceRepo}:${sourceTag}`);
+    });
+  }
+
+  /**
+   * 先存成本地 tarball 再推送（有清理機制）
+   */
+  async syncImageWithTarball(
+    sourceRegistry: string,
+    sourceRepo: string,
+    sourceTag: string,
+    destRegistry: string,
+    destRepo: string,
+    destTag: string,
+  ) {
+    return this.queue.add(async () => {
+      await this.waitForMemoryAvailability();
+
+      const sourceClient = this.clientFactory.create(sourceRegistry);
+      const destClient = this.clientFactory.create(destRegistry);
+
+      this.logger.log(`[Tarball] Start syncing ${sourceRegistry}/${sourceRepo}:${sourceTag} → ${destRegistry}/${destRepo}:${destTag}`);
+
+      // 1. 取 manifest
+      const manifest = await sourceClient.getManifest(sourceRepo, sourceTag);
+      const configDigest = manifest.config.digest;
+
+      // 2. 下載所有 blobs 到 tmp 檔案
+      const blobs: { digest: string; size: number; filePath: string }[] = [];
+
+      // 下載 config blob
+      const configPath = path.join(TMP_DIR, `${configDigest.replace(':', '_')}.blob`);
+      await this.downloadBlobToFile(sourceClient, sourceRepo, configDigest, configPath);
+      blobs.push({ digest: configDigest, size: 0, filePath: configPath }); // size 可不設或讀檔取得
+
+      // 下載所有 layer blobs
+      for (const layer of manifest.layers) {
+        const layerPath = path.join(TMP_DIR, `${layer.digest.replace(':', '_')}.blob`);
+        await this.downloadBlobToFile(sourceClient, sourceRepo, layer.digest, layerPath);
+        blobs.push({ digest: layer.digest, size: 0, filePath: layerPath });
+      }
+
+      // 3. 讀檔推送所有 blobs
+      for (const blob of blobs) {
+        await this.pushBlobFromFile(destClient, destRepo, blob.digest, blob.filePath);
+      }
+
+      // 4. 推送 manifest
+      await destClient.putManifest(destRepo, destTag, manifest);
+
+      // 5. 清理 tmp 檔案
+      for (const blob of blobs) {
+        try {
+          fs.unlinkSync(blob.filePath);
+          this.logger.log(`[Tarball] Cleaned up temp file: ${blob.filePath}`);
+        } catch (e) {
+          this.logger.warn(`[Tarball] Failed to delete temp file: ${blob.filePath} - ${e.message}`);
+        }
+      }
+
+      this.logger.log(`[Tarball] Sync complete for ${sourceRegistry}/${sourceRepo}:${sourceTag}`);
+    });
+  }
+
+  private async downloadBlobToFile(client, repository: string, digest: string, filePath: string) {
+    const { stream } = await client.pullBlobAsStream(repository, digest);
+    const writeStream = fs.createWriteStream(filePath);
+    await pipelineAsync(stream, writeStream);
+  }
+
+  private async pushBlobFromFile(client, repository: string, digest: string, filePath: string) {
+    const uploadUrl = await client.startBlobUpload(repository);
+    const finalUrl = `${uploadUrl}${uploadUrl.includes('?') ? '&' : '?'}digest=${digest}`;
+    const readStream = fs.createReadStream(filePath);
+
+    await new Promise<void>((resolve, reject) => {
+      const req = client['client'].request({
+        method: 'PUT',
+        url: finalUrl,
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          // 'Content-Length' 可能不易知道，Docker registry 可以不必帶，或 fs.statSync(filePath).size
+          'Content-Length': fs.statSync(filePath).size.toString(),
+        },
+        data: readStream,
+      });
+
+      req.then(res => {
+        if (res.status !== 201) {
+          reject(new Error(`Failed to push blob from file, status: ${res.status}`));
+        } else {
+          resolve();
+        }
+      }).catch(err => reject(err));
+    });
+  }
+}
