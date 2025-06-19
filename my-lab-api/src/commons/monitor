@@ -1,0 +1,380 @@
+太好了，我來一次給你完整說明 👇
+
+---
+
+## 🔧 套件使用樣板（含 API 呼叫次數與延遲時間監控）
+
+### ✅ 安裝套件（如果還沒裝）：
+
+```bash
+npm install @willsoto/nestjs-prometheus prom-client
+```
+
+---
+
+### 📁 app.module.ts：
+
+```ts
+import { Module } from '@nestjs/common';
+import { PrometheusModule } from '@willsoto/nestjs-prometheus';
+import { APP_INTERCEPTOR } from '@nestjs/core';
+import { MetricsInterceptor } from './metrics.interceptor';
+import { ExampleController } from './example.controller';
+import { ExampleService } from './example.service';
+
+@Module({
+  imports: [PrometheusModule.register()],
+  controllers: [ExampleController],
+  providers: [
+    ExampleService,
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: MetricsInterceptor, // 將 MetricsInterceptor 註冊為全域攔截器
+    },
+  ],
+})
+export class AppModule {}
+```
+
+---
+
+### 📁 metrics.interceptor.ts（攔截器：延遲 + 次數）
+
+```ts
+import {
+  CallHandler,
+  ExecutionContext,
+  Injectable,
+  NestInterceptor,
+} from '@nestjs/common';
+import { Observable } from 'rxjs';
+import { tap } from 'rxjs/operators';
+import { Histogram, Counter, register } from 'prom-client';
+
+const httpRequestDuration = new Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'Duration of HTTP requests in seconds',
+  labelNames: ['method', 'route', 'status_code'],
+  buckets: [0.1, 0.5, 1, 2, 5],
+});
+
+const httpRequestCounter = new Counter({
+  name: 'http_requests_total',
+  help: 'Total number of HTTP requests',
+  labelNames: ['method', 'route', 'status_code'],
+});
+
+@Injectable()
+export class MetricsInterceptor implements NestInterceptor {
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+    const now = Date.now();
+    const req = context.switchToHttp().getRequest();
+    const method = req.method;
+    const route = req.route?.path || req.url;
+
+    return next.handle().pipe(
+      tap(() => {
+        const statusCode = context.switchToHttp().getResponse().statusCode;
+
+        httpRequestDuration
+          .labels(method, route, String(statusCode))
+          .observe((Date.now() - now) / 1000);
+
+        httpRequestCounter
+          .labels(method, route, String(statusCode))
+          .inc();
+      }),
+    );
+  }
+}
+```
+
+---
+
+### 📁 example.controller.ts（測試用）
+
+```ts
+import { Controller, Get } from '@nestjs/common';
+import { ExampleService } from './example.service';
+
+@Controller('example')
+export class ExampleController {
+  constructor(private readonly exampleService: ExampleService) {}
+
+  @Get()
+  getExample() {
+    return this.exampleService.doSomething();
+  }
+}
+```
+
+---
+
+## 📊 `/metrics` 預設會有哪些 Prometheus 指標？
+
+這些是 Prometheus client library 預設就會輸出的系統指標（由 `prom-client` 提供）：
+
+| 指標名稱                               | 說明                     |
+| ---------------------------------- | ---------------------- |
+| `process_cpu_user_seconds_total`   | 使用者 CPU 時間             |
+| `process_cpu_system_seconds_total` | 系統 CPU 時間              |
+| `process_resident_memory_bytes`    | 使用中的記憶體                |
+| `process_start_time_seconds`       | 程序啟動時間（秒）              |
+| `nodejs_eventloop_lag_seconds`     | Node.js event loop lag |
+| `nodejs_heap_size_used_bytes`      | 使用的 heap 大小            |
+| `nodejs_gc_runs_total`             | 垃圾回收次數                 |
+
+> 📍 這些都是你**不需要額外設定**就能監控的資源健康與效能指標。
+
+---
+
+## 📌 版本控制是否可支援？
+
+Prometheus 指標本身沒有“版本”的概念，但 **你可以透過 Label 來達成版本化的管理**，例如：
+
+```ts
+const httpRequestCounter = new Counter({
+  name: 'http_requests_total',
+  help: 'Total number of HTTP requests',
+  labelNames: ['method', 'route', 'status_code', 'version'],
+});
+```
+
+然後在攔截器中加上 version label：
+
+```ts
+httpRequestCounter
+  .labels(method, route, String(statusCode), 'v1')
+  .inc();
+```
+
+這樣你就可以在 Prometheus 或 Grafana 中依照 `version="v1"` 或 `v2` 做分流統計。
+
+---
+
+### ✅ 建議的版本化實踐：
+
+如果你使用 NestJS 的版本化路由（例如 `/v1/users` vs `/v2/users`），可以自動從 URL 推導出 version label：
+
+```ts
+const version = route.split('/')[1]; // 例如從 "/v1/users" 拿到 "v1"
+```
+
+---
+
+如果你有需求，我可以幫你改寫成支援「動態自動判斷版本」的 label 加入喔！
+
+要我幫你加上嗎？或是你現在的 API 有使用版本路由嗎？我可以直接針對你的設計做建議 ✅
+
+
+
+
+非常好！以下是**最終強化版的 `MetricsInterceptor`**，功能包含：
+
+---
+
+### ✅ 功能總表：
+
+| 功能               | 說明                                  |
+| ---------------- | ----------------------------------- |
+| ✔️ 動態擷取版本號       | 自動從 URL 中解析 `/v1/`、`/api/v2/` 等版本字串 |
+| ✔️ 自訂 prefix 過濾  | 只統計 `/api` 路徑開頭的請求                  |
+| ✔️ 排除 `/metrics` | 避免 Prometheus 自己抓 `/metrics` 時也被記錄  |
+
+---
+
+## ✅ 最終版 `metrics.interceptor.ts`
+
+```ts
+import {
+  CallHandler,
+  ExecutionContext,
+  Injectable,
+  NestInterceptor,
+} from '@nestjs/common';
+import { Observable } from 'rxjs';
+import { tap } from 'rxjs/operators';
+import { Histogram, Counter } from 'prom-client';
+
+// Prometheus 指標定義
+const httpRequestDuration = new Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'Duration of HTTP requests in seconds',
+  labelNames: ['method', 'route', 'status_code', 'version'],
+  buckets: [0.1, 0.5, 1, 2, 5],
+});
+
+const httpRequestCounter = new Counter({
+  name: 'http_requests_total',
+  help: 'Total number of HTTP requests',
+  labelNames: ['method', 'route', 'status_code', 'version'],
+});
+
+// ✅ 可自訂你要監控的路徑前綴
+const MONITORED_PREFIX = '/api';
+
+@Injectable()
+export class MetricsInterceptor implements NestInterceptor {
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+    const now = Date.now();
+    const request = context.switchToHttp().getRequest();
+    const response = context.switchToHttp().getResponse();
+
+    const method = request.method;
+    const url = request.originalUrl || request.url;
+    const route = request.route?.path || url;
+
+    // ✅ 排除 /metrics endpoint 自己
+    if (url.startsWith('/metrics')) {
+      return next.handle();
+    }
+
+    // ✅ 只監控以 MONITORED_PREFIX 開頭的請求
+    if (!url.startsWith(MONITORED_PREFIX)) {
+      return next.handle();
+    }
+
+    const version = this.extractVersionFromUrl(url);
+
+    return next.handle().pipe(
+      tap(() => {
+        const statusCode = response.statusCode;
+
+        httpRequestDuration
+          .labels(method, route, String(statusCode), version)
+          .observe((Date.now() - now) / 1000);
+
+        httpRequestCounter
+          .labels(method, route, String(statusCode), version)
+          .inc();
+      }),
+    );
+  }
+
+  private extractVersionFromUrl(url: string): string {
+    const match = url.match(/\/(v\d+)(\/|$)/i);
+    return match ? match[1] : 'unknown';
+  }
+}
+```
+
+---
+
+## 🧪 範例情境說明
+
+| 請求路徑             | 是否統計 | version |
+| ---------------- | ---- | ------- |
+| `/api/v1/users`  | ✅ 是  | `v1`    |
+| `/api/v2/orders` | ✅ 是  | `v2`    |
+| `/v1/internal`   | ❌ 否  | -       |
+| `/metrics`       | ❌ 否  | -       |
+| `/healthz`       | ❌ 否  | -       |
+
+---
+
+## 🛠 若你希望 prefix 可動態設定
+
+你可以從 `.env` 設定：
+
+```env
+MONITOR_PREFIX=/api
+```
+
+然後在程式中用：
+
+```ts
+const MONITORED_PREFIX = process.env.MONITOR_PREFIX || '/api';
+```
+
+---
+
+是否也想加上：
+
+* 只記錄特定 HTTP 方法（如 GET / POST）？
+* 排除特定 Status Code（如 4xx 不記錄）？
+
+我可以再幫你升級為進階條件版 ✅
+
+
+
+📈 Prometheus/Grafana 查詢範例：
+sum by (version) (rate(http_requests_total[5m]))
+這樣你就能統計：
+
+每 5 分鐘內，每個版本的 API 呼叫次數
+
+avg by (version) (rate(http_request_duration_seconds_sum[5m]) / rate(http_request_duration_seconds_count[5m]))
+這是：
+
+每個版本平均的 API 延遲時間（秒）
+
+
+很棒的問題，簡短回答是：
+
+> **不會直接衝突，但需要小心避免「重複紀錄」或「指標重複命名」的問題。**
+
+---
+
+## 🔍 OpenTelemetry 與 Prometheus 的關係
+
+* **OpenTelemetry（OTel）** 是觀測性標準，可支援 trace（追蹤）、metric（指標）、log（日誌）。
+* **Prometheus** 是一種指標拉取（pull-based）的系統。
+* 兩者可以整合，但 **你現在使用的 `prom-client`（+ `@willsoto/nestjs-prometheus`）是直接用 Node.js SDK 記錄 metrics**，這會和 OpenTelemetry 記錄 metric 時**使用不同的後端**。
+
+---
+
+## ⚠️ 可能的衝突或注意事項
+
+| 類型                  | 描述                                                                          | 解法                                                                     |
+| ------------------- | --------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| ❗ **指標名稱衝突**        | 如果 OTel 也紀錄了名為 `http_requests_total` 的指標，Prometheus 會報錯：「duplicate metrics」 | ✅ 確保命名獨立，例如 `otel_http_requests_total` vs `custom_http_requests_total` |
+| ❗ **資料重複**          | 同一筆 HTTP 請求，同時被 OTel 與 Interceptor 記錄一次                                     | ✅ 決定你只用哪一個記錄 HTTP 指標；或用 OTel 處理 trace + metrics，Interceptor 專注於自訂邏輯    |
+| ⚠️ **不同 export 模式** | `prom-client` 是 Pull 模式；OpenTelemetry 有支援 Push / Exporter 模式（例如 OTLP）       | ✅ 如果你是純 Prometheus 環境，用 `prom-client` 較自然；否則建議讓 OTel 統一收集 metrics      |
+
+---
+
+## ✅ 建議你這樣做：
+
+### A. 如果你只是要 Prometheus dashboard + Grafana：
+
+✔️ 繼續使用 `@willsoto/nestjs-prometheus` + `prom-client`
+✔️ **不需要 OTel 來處理 metrics**（只用它 trace 比較好）
+
+### B. 如果你已經有 OpenTelemetry 並打算用它收集 **所有觀測資料（trace + metric）**：
+
+✔️ 你應該 **不要同時使用 prom-client 自行輸出 /metrics endpoint**
+✔️ 改用 OTel 的 Metric exporter，例如 [@opentelemetry/exporter-prometheus](https://www.npmjs.com/package/@opentelemetry/exporter-prometheus)
+
+---
+
+## 💡 Bonus：怎麼用 OTel 產生 Prometheus metrics？
+
+如果你要走 B 路線，可以這樣設定 exporter：
+
+```ts
+import { PrometheusExporter } from '@opentelemetry/exporter-prometheus';
+import { MeterProvider } from '@opentelemetry/sdk-metrics';
+
+const exporter = new PrometheusExporter({ port: 9464 }, () => {
+  console.log('Prometheus scrape endpoint: http://localhost:9464/metrics');
+});
+
+const meterProvider = new MeterProvider();
+meterProvider.addMetricReader(exporter);
+```
+
+這樣 Prometheus 就抓 `http://localhost:9464/metrics`，由 OTel 負責產生指標。
+
+---
+
+## ✅ 結論
+
+| 你想要的結果                           | 建議                                                       |
+| -------------------------------- | -------------------------------------------------------- |
+| 快速部署 Prometheus metrics          | 繼續用 `@willsoto/nestjs-prometheus`，**不要用 OTel 收 metrics** |
+| 全面導入觀測性（logs + traces + metrics） | 用 OpenTelemetry，**關掉 prom-client 的 metrics endpoint**    |
+| 兩者都用                             | 小心指標名稱、避免雙重紀錄                                            |
+
+---
+
+👉 如果你告訴我你目前是否有在用 OpenTelemetry trace/exporter，我可以幫你設計一個不衝突的架構建議。是否需要？
