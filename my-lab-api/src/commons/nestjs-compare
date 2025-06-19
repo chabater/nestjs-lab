@@ -1,0 +1,162 @@
+## 📘 NestJS + @nestjs/axios 與 Express + Axios 比較分析
+
+---
+
+### ✅ 專案背景
+
+為服務設計 HTTP 請求模組，需要具備以下功能：
+
+- 支援 `GET` / `POST` / `PUT` / `DELETE`
+- 支援 token / proxy / headers / content 等參數
+- 可支援 retry、timeout、自簽憑證
+- 具備測試能力與可維護性
+
+---
+
+## 🔧 實作方式比較
+
+| 項目 | NestJS + @nestjs/axios | Express + axios |
+| --- | --- | --- |
+| 開發風格 | 模組化、依賴注入、裝飾器 | 自由，無結構約束 |
+| HTTP client | `@nestjs/axios` + RxJS | axios 原生 |
+| 設定 retry / timeout | ✅ 易於擴充、集中處理 | 需自行整合 3rd 套件或邏輯 |
+| Proxy + 自簽憑證處理 | ✅ 透過 Axios agent 完整支援 | ✅ 需自己設定 httpsAgent |
+| 測試能力 | ✅ 容易 mock、好寫單元測試 | ❌ 需手動 mock，耦合較高 |
+| 擴充性（如攔截器、日誌、auth） | ✅ 內建 Interceptor, Guard 支援 | ❌ 需自行實作 |
+| 整體可維護性 | ✅ 高，適合中大型專案 | 🟡 低，適合小型快速開發 |
+
+---
+
+## 🚀 為什麼選擇 NestJS + @nestjs/axios？
+
+1. **依賴注入機制**：可分離邏輯、方便測試與模組注入。
+2. **一致性的模組架構**：更易維護、擴充、重用。
+3. **RxJS 支援**：可組合資料流與重試、異常處理。
+4. **易測試**：在 `Test.createTestingModule` 中 mock 掉 `HttpService` 即可進行單元測試。
+5. **可讀性高**：適合多人開發與跨部門協作。
+
+---
+
+## ✅ 單元測試設計重點
+
+- 使用 `jest` 測試 `HttpApiService` 類別方法（get/post/put/delete）
+- 可模擬：
+    - 正常回應
+    - 429 自動 retry
+    - retry 超過次數後丟出例外
+    - 自簽憑證支援（透過 `https.Agent`）
+
+---
+
+# 📘 NestJS 中使用 RxJS 的最佳實踐指引
+
+> 適用於使用 @nestjs/axios、HttpService、WebSocket、事件流等模組
+> 
+
+---
+
+## 🎯 核心原則
+
+| 原則 | 說明 |
+| --- | --- |
+| ✅ 使用 `lastValueFrom()` 將 Observable 轉成 Promise | 在大多數業務邏輯中，使用 `async/await` 最簡單 |
+| ✅ 保持 `RxJS` 處理集中在底層（如 HttpService） | 通常寫在 `HttpApiService`，上層只管 await |
+| ✅ 只在「串流、多重資料合併」時使用 RxJS operator | 用 `pipe`, `map`, `mergeMap`, `retry` 等 |
+| ❌ **不要在 Service / Controller 層直接 `subscribe()`** | 容易失控，錯誤不會傳遞，無法 await，難測試 |
+
+---
+
+## 📦 RxJS vs async/await：怎麼選？
+
+| 使用情境 | 建議方式 |
+| --- | --- |
+| 單一 RESTful 請求 | ✅ 使用 `lastValueFrom()` → 搭配 `async/await` |
+| 需自動重試（如 429） | ✅ 在 `HttpApiService` 中用 `retry` 或 loop 處理 |
+| 合併多個請求（並行） | ✅ `forkJoin([...])` 或 `Promise.all([...])` |
+| 串流資料 / WebSocket | ✅ 使用 RxJS + `.pipe()` 寫在專用 service |
+| 多層轉換資料流 | ✅ 使用 `map`、`switchMap`，但包裝在底層 module |
+
+---
+
+## ✅ 實作範例
+
+### ✔ 建議做法：在底層封裝 Observable，對外 Promise
+
+```tsx
+
+// HttpApiService
+async get<T>(url: string, options?: HttpOptions): Promise<T> {
+  const config = this.buildConfig(options);
+  return this.requestWithRetry(() =>
+    lastValueFrom(this.httpService.get<T>(url, config))
+  );
+}
+
+```
+
+```tsx
+
+// util.ts
+@Injectable()
+export class MyUtil {
+  constructor(private readonly http: HttpApiService) {}
+
+  async getUser(id: string) {
+    return await this.http.get(`/users/${id}`);
+  }
+}
+
+```
+
+---
+
+## ❌ 錯誤示範：直接 `subscribe()` 造成問題
+
+```tsx
+
+this.httpService.get('/api').subscribe((res) => {
+  console.log(res.data); // 👎 無法 await
+});
+
+```
+
+- 無法用 `await` 控制流程
+- 錯誤無法 bubble 出來給 caller
+- 測試難 mock/驗證 callback
+
+---
+
+## 🛠 常用 RxJS 工具與轉換
+
+| RxJS 工具 | 說明 |
+| --- | --- |
+| `lastValueFrom()` | ✅ 將 Observable → Promise（單一回傳值） |
+| `retry(n)` | 自動重試 n 次（可搭配 `catchError`） |
+| `forkJoin([obs1, obs2])` | 多個 observable 並行處理、等待全部完成 |
+| `map()` | 轉換資料 |
+| `catchError()` | 錯誤處理與轉換 |
+| `switchMap()` | 用來串接多個 HTTP 流，避免巢狀 |
+
+---
+
+## 📌 實務建議
+
+- 在 `HttpApiService` 中處理一切 RxJS 管理（錯誤、重試、轉換）
+- 在 Controller、Util、業務邏輯中保持乾淨的 `await`
+- 撰寫複雜串流邏輯時，集中在專門的 `StreamService` 或 WebSocket gateway
+- 單元測試上，盡可能讓外部邏輯依賴 Promise 結果，而非 Observable，這樣更容易 mock
+
+---
+
+## ✅ 範例架構建議
+
+```
+
+📁 src
+├── http-api
+│   ├── http-api.service.ts    <-- RxJS 轉 Promise 封裝
+├── user
+│   ├── user.util.ts           <-- async/await 呼叫 HttpApiService
+│   ├── user.controller.ts     <-- Controller 呼叫 util 層
+
+```

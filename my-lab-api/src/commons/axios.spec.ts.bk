@@ -1,0 +1,116 @@
+import { Test, TestingModule } from '@nestjs/testing';
+import { HttpApiService } from './http-api.service';
+import { HttpService } from '@nestjs/axios';
+import { of, throwError } from 'rxjs';
+import { AxiosResponse } from 'axios';
+
+describe('HttpApiService', () => {
+  let service: HttpApiService;
+  let httpService: HttpService;
+
+  const mockResponse = <T>(data: T): AxiosResponse<T> => ({
+    data,
+    status: 200,
+    statusText: 'OK',
+    headers: {},
+    config: {},
+  });
+
+  const mockHttpService = {
+    get: jest.fn(),
+    post: jest.fn(),
+    put: jest.fn(),
+    delete: jest.fn(),
+  };
+
+  beforeEach(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        HttpApiService,
+        { provide: HttpService, useValue: mockHttpService },
+      ],
+    }).compile();
+
+    service = module.get<HttpApiService>(HttpApiService);
+    httpService = module.get<HttpService>(HttpService);
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('should GET successfully', async () => {
+    mockHttpService.get.mockReturnValue(of(mockResponse({ success: true })));
+
+    const result = await service.get('https://test.com');
+    expect(result).toEqual({ success: true });
+    expect(mockHttpService.get).toHaveBeenCalled();
+  });
+
+  it('should POST with content', async () => {
+    mockHttpService.post.mockReturnValue(of(mockResponse({ ok: true })));
+
+    const result = await service.post('https://test.com', {
+      content: { name: 'Test' },
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect(mockHttpService.post).toHaveBeenCalledWith(
+      'https://test.com',
+      { name: 'Test' },
+      expect.any(Object),
+    );
+  });
+
+  it('should retry on 429 error', async () => {
+    const errorResponse = {
+      response: { status: 429 },
+      message: 'Too many requests',
+    };
+
+    const mockFn = jest
+      .fn()
+      .mockReturnValueOnce(throwError(() => errorResponse))
+      .mockReturnValueOnce(throwError(() => errorResponse))
+      .mockReturnValueOnce(of(mockResponse({ retried: true })));
+
+    mockHttpService.get = mockFn;
+
+    const result = await service.get('https://retry.com', {
+      retryCount: 2,
+    });
+
+    expect(result).toEqual({ retried: true });
+    expect(mockFn).toHaveBeenCalledTimes(3);
+  });
+
+  it('should fail after retry limit', async () => {
+    const errorResponse = {
+      response: { status: 429 },
+      message: 'Too many requests',
+    };
+
+    mockHttpService.get = jest
+      .fn()
+      .mockReturnValue(throwError(() => errorResponse));
+
+    await expect(
+      service.get('https://fail.com', { retryCount: 1 }),
+    ).rejects.toThrow('Too many requests');
+
+    expect(mockHttpService.get).toHaveBeenCalledTimes(2);
+  });
+
+  it('should handle HTTPS self-signed certs', async () => {
+    mockHttpService.get.mockReturnValue(of(mockResponse({ secure: true })));
+
+    const result = await service.get('https://insecure.local', {});
+    expect(result).toEqual({ secure: true });
+    expect(mockHttpService.get).toHaveBeenCalledWith(
+      'https://insecure.local',
+      expect.objectContaining({
+        httpsAgent: expect.objectContaining({ options: expect.any(Object) }),
+      }),
+    );
+  });
+});

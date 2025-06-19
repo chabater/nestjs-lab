@@ -1,0 +1,109 @@
+import { HttpService } from '@nestjs/axios';
+import { Injectable, Logger } from '@nestjs/common';
+import { lastValueFrom, catchError, retryWhen, delay, take, throwError } from 'rxjs';
+import { AxiosRequestConfig } from 'axios';
+import * as https from 'https';
+
+interface HttpOptions {
+  token?: string;
+  proxy?: string;
+  headers?: Record<string, string>;
+  content?: any;
+  timeoutMs?: number; // 加入 timeout 設定
+  retryCount?: number; // 加入重試次數
+}
+
+@Injectable()
+export class HttpApiService {
+  private readonly logger = new Logger(HttpApiService.name);
+
+  constructor(private readonly httpService: HttpService) {}
+
+  private buildConfig(options: HttpOptions = {}): AxiosRequestConfig {
+    const config: AxiosRequestConfig = {
+      headers: {
+        ...(options.token ? { Authorization: `Bearer ${options.token}` } : {}),
+        ...options.headers,
+      },
+      timeout: options.timeoutMs ?? 5000, // 預設 5 秒 timeout
+      httpsAgent: new https.Agent({ rejectUnauthorized: false }), // 可接受自簽憑證
+    };
+
+    if (options.proxy) {
+      const [host, port] = options.proxy.split(':');
+      config.proxy = {
+        host,
+        port: parseInt(port),
+      };
+    }
+
+    return config;
+  }
+
+  private async requestWithRetry<T>(
+    method: () => Promise<T>,
+    retryCount = 0,
+  ): Promise<T> {
+    let attempts = 0;
+    const maxAttempts = retryCount + 1;
+
+    while (attempts < maxAttempts) {
+      try {
+        return await method();
+      } catch (err) {
+        const status = err?.response?.status;
+        const isRetryable = status === 429;
+
+        if (!isRetryable || attempts === retryCount) {
+          this.logger.error(`HTTP error after ${attempts + 1} attempts`, err?.message);
+          throw err;
+        }
+
+        const waitTime = 1000 * (attempts + 1); // 線性 delay
+        this.logger.warn(`Retrying due to 429... attempt ${attempts + 1}, waiting ${waitTime}ms`);
+        await new Promise((r) => setTimeout(r, waitTime));
+        attempts++;
+      }
+    }
+
+    throw new Error('Request failed after maximum retries');
+  }
+
+  async get<T = any>(url: string, options?: HttpOptions): Promise<T> {
+    const config = this.buildConfig(options);
+    return this.requestWithRetry(
+      () => lastValueFrom(this.httpService.get<T>(url, config)),
+      options?.retryCount ?? 0,
+    );
+  }
+
+  async post<T = any>(url: string, options?: HttpOptions): Promise<T> {
+    const config = this.buildConfig(options);
+    return this.requestWithRetry(
+      () =>
+        lastValueFrom(
+          this.httpService.post<T>(url, options?.content ?? {}, config),
+        ),
+      options?.retryCount ?? 0,
+    );
+  }
+
+  async put<T = any>(url: string, options?: HttpOptions): Promise<T> {
+    const config = this.buildConfig(options);
+    return this.requestWithRetry(
+      () =>
+        lastValueFrom(
+          this.httpService.put<T>(url, options?.content ?? {}, config),
+        ),
+      options?.retryCount ?? 0,
+    );
+  }
+
+  async delete<T = any>(url: string, options?: HttpOptions): Promise<T> {
+    const config = this.buildConfig(options);
+    return this.requestWithRetry(
+      () => lastValueFrom(this.httpService.delete<T>(url, config)),
+      options?.retryCount ?? 0,
+    );
+  }
+}
