@@ -1,1 +1,22 @@
 https://hub.docker.com/u/deepflowce
+
+
+    image: registry.cn-hongkong.aliyuncs.com/deepflow-ce/mysql:8.0.31
+    image: registry.cn-hongkong.aliyuncs.com/deepflow-ce/clickhouse-server:23.8.7.24
+    image: registry.cn-hongkong.aliyuncs.com/deepflow-ce/deepflow-server:${DEEPFLOW_VERSION}
+    image: registry.cn-hongkong.aliyuncs.com/deepflow-ce/deepflow-app:${DEEPFLOW_VERSION}
+    image: registry.cn-hongkong.aliyuncs.com/deepflow-ce/deepflowio-init-grafana-ds-dh:latest
+    image: registry.cn-hongkong.aliyuncs.com/deepflow-ce/deepflowio-init-grafana-ds-dh:latest
+    image: registry.cn-hongkong.aliyuncs.com/deepflow-ce/deepflowio-init-grafana:latest
+    image: registry.cn-hongkong.aliyuncs.com/deepflow-ce/grafana:10.1.5
+
+    docker pull deepflowce/mysql:8.0.39
+    docker pull deepflowce/clickhouse-server:23.10
+    docker pull deepflowce/deepflow-server:v6.6
+    docker pull deepflowce/deepflow-server:v7.0.9
+    docker pull deepflowce/deepflow-app:v6.6
+    docker pull deepflowce/deepflow-app:v7.0
+    docker pull deepflowce/deepflowio-init-grafana-ds-dh:v7.0
+    docker pull deepflowce/deepflowio-init-grafana:v7.0
+    docker pull deepflowce/grafana:10.4.3
+
