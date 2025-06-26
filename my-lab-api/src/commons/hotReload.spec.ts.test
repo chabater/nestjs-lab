@@ -1,0 +1,84 @@
+import { Test, TestingModule } from '@nestjs/testing';
+import { ServerConfigService } from './server-config.service';
+import * as mockFs from 'mock-fs';
+import * as fs from 'fs';
+import * as path from 'path';
+
+const mockConfigPath = path.resolve('/etc/config/server.json');
+
+// 模擬 JSON 設定
+const mockJson = JSON.stringify({
+  DEV: {
+    'MY-LAB-ENV': {
+      SERVER1: '10.10.10.1',
+      SERVER2: '10.10.10.2',
+    },
+  },
+});
+
+describe('ServerConfigService', () => {
+  let service: ServerConfigService;
+
+  beforeEach(async () => {
+    // 模擬檔案系統
+    mockFs({
+      '/etc/config': {
+        'server.json': mockJson,
+      },
+    });
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [ServerConfigService],
+    }).compile();
+
+    service = module.get<ServerConfigService>(ServerConfigService);
+  });
+
+  afterEach(() => {
+    mockFs.restore(); // 清除 mock
+  });
+
+  it('should be defined', () => {
+    expect(service).toBeDefined();
+  });
+
+  it('should load config and return correct IP (safeGet)', () => {
+    const ip = service.getServerIpSafe('DEV', 'MY-LAB-ENV', 'SERVER1');
+    expect(ip).toBe('10.10.10.1');
+  });
+
+  it('should return undefined for unknown cluster/server (safeGet)', () => {
+    const ip = service.getServerIpSafe('DEV', 'UNKNOWN-CLUSTER', 'SERVER1');
+    expect(ip).toBeUndefined();
+
+    const ip2 = service.getServerIpSafe('DEV', 'MY-LAB-ENV', 'NOT-EXIST');
+    expect(ip2).toBeUndefined();
+  });
+
+  it('should return IP when using strictGet', () => {
+    const ip = service.getServerIpStrict('DEV', 'MY-LAB-ENV', 'SERVER2');
+    expect(ip).toBe('10.10.10.2');
+  });
+
+  it('should throw when using strictGet with missing value', () => {
+    expect(() =>
+      service.getServerIpStrict('DEV', 'MY-LAB-ENV', 'NOT-EXIST'),
+    ).toThrowError(/Missing IP/);
+  });
+
+  it('should fallback to default config if file is invalid JSON', () => {
+    // 模擬錯誤格式
+    mockFs({
+      '/etc/config': {
+        'server.json': '{ invalid json',
+      },
+    });
+
+    // 手動建立新實例來觸發載入
+    const newService = new ServerConfigService();
+
+    // 測試 fallback 預設值（來自 SERVER_DEFAULT）
+    const ip = newService.getServerIpSafe('DEV', 'MY-LAB-ENV', 'SERVER1');
+    expect(ip).toBe('8.8.8.8'); // SERVER_DEFAULT 中的值
+  });
+});

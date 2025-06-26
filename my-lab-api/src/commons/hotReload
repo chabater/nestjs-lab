@@ -1,0 +1,274 @@
+目錄結構建議
+arduino
+src/
+└── config/
+    ├── server-default.ts        # 預設設定值 + 型別
+    ├── server-config.service.ts # 設定服務（熱重載 + 讀取 + 查詢）
+    └── config.module.ts         # 可注入的 Nest 模組
+✅ server-default.ts
+ts
+export const SERVER_DEFAULT = {
+  DEV: {
+    'MY-LAB-ENV': {
+      SERVER1: '8.8.8.8',
+      SERVER2: '9.9.9.9',
+    },
+  },
+  STAGE: {
+    'MY-STAGE-ENV': {
+      SERVER1: '1.1.1.1',
+      SERVER2: '2.2.2.2',
+    },
+  },
+} as const;
+
+export type ServerConfig = typeof SERVER_DEFAULT;
+export type EnvKey = keyof ServerConfig;
+✅ server-config.service.ts
+ts
+import { Injectable, Logger } from '@nestjs/common';
+import * as fs from 'fs';
+import * as chokidar from 'chokidar';
+import * as path from 'path';
+import { SERVER_DEFAULT, ServerConfig, EnvKey } from './server-default';
+
+@Injectable()
+export class ServerConfigService {
+  private readonly logger = new Logger(ServerConfigService.name);
+  private readonly configPath = path.resolve('/etc/config/server.json'); // 可改為其他位置
+  private config: ServerConfig = SERVER_DEFAULT;
+
+  constructor() {
+    this.loadConfig();
+    this.watchConfig();
+  }
+
+  private loadConfig() {
+    try {
+      const raw = fs.readFileSync(this.configPath, 'utf-8');
+      const parsed = JSON.parse(raw) as Partial<ServerConfig>;
+      this.config = { ...SERVER_DEFAULT, ...parsed };
+      this.logger.log('✅ Server config loaded');
+    } catch (err) {
+      this.logger.error('❌ Failed to load config: ' + err.message);
+    }
+  }
+
+  private watchConfig() {
+    chokidar.watch(this.configPath, {
+      usePolling: true,
+      interval: 1000,
+    }).on('change', () => {
+      this.logger.log('🔄 server.json changed, reloading...');
+      this.loadConfig();
+    });
+  }
+
+  getServerIpSafe(env: EnvKey, cluster: string, serverName: string): string | undefined {
+    return this.config?.[env]?.[cluster]?.[serverName];
+  }
+
+  getServerIpStrict(env: EnvKey, cluster: string, serverName: string): string {
+    const ip = this.getServerIpSafe(env, cluster, serverName);
+    if (!ip) {
+      throw new Error(`❗Missing IP for ${env}.${cluster}.${serverName}`);
+    }
+    return ip;
+  }
+
+  // 可用來查看整份 config
+  getAll(): ServerConfig {
+    return this.config;
+  }
+}
+✅ config.module.ts
+ts
+import { Module } from '@nestjs/common';
+import { ServerConfigService } from './server-config.service';
+
+@Module({
+  providers: [ServerConfigService],
+  exports: [ServerConfigService],
+})
+export class ConfigModule {}
+✅ 使用方式（其他模組注入）
+ts
+import { Injectable } from '@nestjs/common';
+import { ServerConfigService } from './config/server-config.service';
+
+@Injectable()
+export class SomeService {
+  constructor(private readonly configService: ServerConfigService) {}
+
+  doSomething() {
+    const ip = this.configService.getServerIpSafe('DEV', 'MY-LAB-ENV', 'SERVER1') || '127.0.0.1';
+    const dbIp = this.configService.getServerIpStrict('STAGE', 'MY-STAGE-ENV', 'SERVER1');
+    console.log('Using IP:', ip, dbIp);
+  }
+}
+✅ Kubernetes ConfigMap YAML 範例（server.json）
+yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: server-config
+data:
+  server.json: |
+    {
+      "DEV": {
+        "MY-LAB-ENV": {
+          "SERVER1": "10.0.0.1",
+          "SERVER2": "10.0.0.2"
+        }
+      }
+    }
+Volume 掛載範例：
+
+yaml
+volumeMounts:
+  - name: config
+    mountPath: /etc/config/server.json
+    subPath: server.json
+
+volumes:
+  - name: config
+    configMap:
+      name: server-config
+✅ 擴充建議（可選）
+加上 .getAllClusters(env: EnvKey): string[]
+
+加上 .getAllEnvs(): EnvKey[]
+
+發送 EventBus 事件讓其他模組「訂閱設定變化」
+
+自動記錄哪些設定被誰查詢過（加強觀察）
+
+
+
+
+
+
+
+目標
+測試 chokidar 檔案監控有正確觸發 loadConfig()
+
+不真的監控檔案，而是用 mock 模擬 chokidar.watch().on('change', ...)
+
+透過 spy 或 mock 確認 loadConfig() 被呼叫次數
+
+✅ 測試關鍵技巧：mock chokidar
+🧱 第一步：Mock chokidar module
+在 __mocks__/chokidar.ts 下建立自訂 mock：
+
+ts
+// __mocks__/chokidar.ts
+const chokidarMock = {
+  watch: jest.fn(() => ({
+    on: jest.fn(),
+  })),
+};
+
+export default chokidarMock;
+或者簡單在測試檔中直接 mock：
+
+ts
+jest.mock('chokidar', () => {
+  const onFn = jest.fn();
+  const mockWatcher = {
+    on: onFn,
+  };
+  return {
+    watch: jest.fn(() => mockWatcher),
+    __mockWatcher: mockWatcher,
+    __onFn: onFn,
+  };
+});
+
+✅ 完整測試：觸發 reload + 驗證 loadConfig 被呼叫
+ts
+import { Test, TestingModule } from '@nestjs/testing';
+import { ServerConfigService } from './server-config.service';
+import * as mockFs from 'mock-fs';
+import * as fs from 'fs';
+import * as path from 'path';
+import chokidar from 'chokidar'; // 此處會自動導入 mock
+import { jest } from '@jest/globals';
+
+const mockConfigPath = path.resolve('/etc/config/server.json');
+
+const mockJsonV1 = JSON.stringify({
+  DEV: { 'MY-LAB-ENV': { SERVER1: '1.1.1.1' } },
+});
+
+const mockJsonV2 = JSON.stringify({
+  DEV: { 'MY-LAB-ENV': { SERVER1: '2.2.2.2' } },
+});
+
+describe('ServerConfigService - chokidar reload', () => {
+  let service: ServerConfigService;
+
+  beforeEach(async () => {
+    // 初始 mock 檔案內容
+    mockFs({
+      '/etc/config': {
+        'server.json': mockJsonV1,
+      },
+    });
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [ServerConfigService],
+    }).compile();
+
+    service = module.get<ServerConfigService>(ServerConfigService);
+  });
+
+  afterEach(() => {
+    mockFs.restore();
+    jest.clearAllMocks();
+  });
+
+  it('should call loadConfig when chokidar emits change', async () => {
+    const loadSpy = jest.spyOn(service as any, 'loadConfig');
+
+    // 模擬檔案變更
+    const chokidarModule = await import('chokidar') as any;
+    const watcherOn = chokidarModule.__onFn as jest.Mock;
+
+    // 取得註冊的 on('change', cb)
+    const changeCallback = watcherOn.mock.calls.find(call => call[0] === 'change')?.[1];
+    expect(typeof changeCallback).toBe('function');
+
+    // 更新 mockFs 的內容，模擬檔案變更
+    mockFs({
+      '/etc/config': {
+        'server.json': mockJsonV2,
+      },
+    });
+
+    // 手動呼叫模擬的 change callback（模擬 chokidar 偵測到改動）
+    changeCallback();
+
+    // 驗證 loadConfig 有被呼叫
+    expect(loadSpy).toHaveBeenCalled();
+    expect(service.getServerIpStrict('DEV', 'MY-LAB-ENV', 'SERVER1')).toBe('2.2.2.2');
+  });
+});
+✅ 測試說明
+重點	說明
+jest.mock('chokidar')	攔截 chokidar 真正的行為
+watch().on() 被模擬	可手動觸發 change 事件
+jest.spyOn(service, 'loadConfig')	監控有沒有正確 reload
+mockFs 模擬檔案內容更新	測試 reload 結果是否正確
+
+🧪 測試通過條件
+loadConfig() 會因 change 被呼叫
+
+getServerIpStrict() 取得的是更新後的 IP (2.2.2.2)
+
+沒有真正觸發 file system watch，但邏輯確實執行
+
+⚠️ 小提醒
+如果你使用的是 esm 模式，需要使用 jest.mock(...) 時確保用 babel-jest 或設好 ts-jest
+
+chokidar mock 若放在全域測試套件中，也能重複使用
+
